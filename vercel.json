@@ -11,5 +11,8 @@
       "src": "/(.*)",
       "dest": "bomb.py"
     }
-  ]
+  ],
+  "env": {
+    "FLASK_ENV": "production"
+  }
 }
